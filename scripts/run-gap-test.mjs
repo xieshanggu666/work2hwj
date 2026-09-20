@@ -212,7 +212,7 @@ const z2 = await mkTicket('删文档问题二')
 await gap.mergeTickets([z1.id, z2.id], editor)
 const doc4 = await mkDoc('会被删除的手册')
 r = await review.submitGapReview(z1.id, doc4.id, patch(doc4), '', editor)
-await kb.deleteDoc(doc4.id)
+await kb.deleteDoc(doc4.id, admin)
 for (const id of [z1.id, z2.id]) {
   const x = await db.gapTickets.get(id)
   assert(x.status === GAP.CLAIMED && !x.docId && !x.reviewId, id + ' 文档删除后退回并清空关联')

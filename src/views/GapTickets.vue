@@ -226,6 +226,10 @@ async function submitGapReview(t, memberCount) {
       alert('该文档已有流转中的评审单，请换一篇文档或等待审批完成。')
     } else if (res.status === 'ticket-changed') {
       alert('工单状态已变化（可能已被取消认领、移出或解散），请刷新查看。')
+    } else if (res.status === 'guest') {
+      alert('访客不能关联文档送审，请先登录。')
+    } else if (res.status === 'denied') {
+      alert('你没有该文档的送审权限：仅文档拥有者、协作成员或管理员可发起评审。')
     } else {
       alert('送审失败：工单或文档状态已变化，请刷新后重试。')
     }

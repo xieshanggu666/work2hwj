@@ -7,7 +7,7 @@ import { useReviewStore } from '@/stores/review'
 import { useAccessStore } from '@/stores/access'
 import RichEditor from '@/components/doc/RichEditor.vue'
 import { docVersion, fieldLabels } from '@/utils/version'
-import { canEditDoc, ROLE } from '@/utils/permission'
+import { canEditDoc, ROLE, GUEST_ID } from '@/utils/permission'
 
 const route = useRoute()
 const router = useRouter()
@@ -119,11 +119,16 @@ async function submit(force = false) {
           alert('该文档已有流转中的评审单，请等待管理员审批后再发起。')
         } else if (res.status === 'missing') {
           alert('文档不存在或已被删除')
+        } else if (res.status === 'guest') {
+          alert('访客不能发起评审，请先登录。')
+        } else {
+          alert('你没有该文档的评审发起权限：仅拥有者、协作成员或管理员可发起。')
         }
         return
       }
       const res = await kb.updateDoc(route.params.id, payload, auth.user, '编辑文档', { baseVersion: baseVersion.value, base: baseDoc.value, force })
       if (!res || res.status === 'missing') { alert('文档不存在或已被删除'); return }
+      if (res.status === 'guest') { alert('访客不能编辑文档，请通过有效的可编辑共享链接访问或登录。'); return }
       if (res.status === 'access-denied') { alert('你没有该文档的编辑权限：限时协作授权已被撤销或到期，编辑权限已收回。'); await load(); return }
       if (res.status === 'review-locked') { alert('该文档正在评审中，审批完成前无法保存修改。'); await load(); return }
       if (res.status === 'conflict') {
@@ -139,6 +144,7 @@ async function submit(force = false) {
       router.push({ path: '/docs/' + route.params.id, query })
     } else {
       const d = await kb.createDoc(payload, auth.user)
+      if (d.status === 'forbidden') { alert('访客或只读成员不能新建文档。'); return }
       localStorage.removeItem(draftKey)
       // 从缺口工单「新建文档补写」进入：发布文档后回到工单中心继续关联送审
       if (route.query.gap) {
@@ -187,7 +193,7 @@ async function load() {
     await accessStore.loadAll()
     activeGrant.value = d ? accessStore.grantOf(d.id, auth.user?.id) : null
     accessDenied.value = d
-      ? !canEditDoc(auth.user?.role, d, auth.user?.id, active, activeGrant.value)
+      ? !canEditDoc(d, { userId: auth.user?.id || GUEST_ID, role: auth.user?.role, grant: activeGrant.value, pendingReview: active })
       : false
     // 限时协作授权的只读成员没有「发起评审」通道，强制直接保存模式
     if (activeGrant.value && auth.user?.role !== ROLE.ADMIN && auth.user?.role !== ROLE.EDITOR) {

@@ -13,8 +13,8 @@ import ReviewPanel from '@/components/doc/ReviewPanel.vue'
 import AccessApplyCard from '@/components/doc/AccessApplyCard.vue'
 import AccessPanel from '@/components/doc/AccessPanel.vue'
 import { formatFull, formatDate, avatarColor } from '@/utils/format'
-import { canEditDoc, canViewDoc, canEditContent } from '@/utils/permission'
-import { versionReviewBadge, versionRestoreBadges } from '@/utils/review'
+import { canEditDoc, canDeleteDoc, canViewDoc, GUEST_ID } from '@/utils/permission'
+import { versionReviewBadge, versionRestoreBadges, canSubmitReview } from '@/utils/review'
 import { diffVersionFields, diffBodyLines, docSnapshot, fieldLabels, versionRangeText } from '@/utils/version'
 import { ACCESS, accessPermLabel, grantExpireText } from '@/utils/access'
 
@@ -59,6 +59,10 @@ const compareLines = computed(() =>
   compareTarget.value?.snapshot && doc.value ? diffBodyLines(compareTarget.value.snapshot.body, doc.value.body) : []
 )
 const restoreTarget = computed(() => versionList.value.find((v) => v.version === restoreVersion.value) || null)
+// 当前流转中的评审单（恢复按钮与发起资格均据此判定）
+const pendingReview = computed(() => (doc.value ? reviewStore.pendingReviewOf(doc.value.id) : null))
+// 当前用户在该文档上的有效限时协作授权（发起恢复评审需文档级写入资格）
+const restoreGrant = computed(() => (doc.value ? accessStore.grantOf(doc.value.id, auth.user?.id) : null))
 // 恢复预览：fromV 之后到当前的所有版本将被回滚并标记边界
 const restorePreview = computed(() => {
   if (!restoreTarget.value || !doc.value) return null
@@ -66,8 +70,12 @@ const restorePreview = computed(() => {
   const rolledBack = versionList.value.filter((v) => v.version > fromV).map((v) => v.version)
   return { fromV, rolledBack }
 })
-// 编辑者/管理员且文档不在评审中时可发起恢复评审
-const canRestore = computed(() => canEditContent(auth.user?.role) && !pendingReview.value)
+// 编辑者/管理员且文档不在评审中、且对本文档有写入资格时可发起恢复评审
+const canRestore = computed(() => canSubmitReview(doc.value, {
+  userId: auth.user?.id || GUEST_ID,
+  role: auth.user?.role,
+  grant: restoreGrant.value
+}, pendingReview.value))
 
 function isIdentical(v) {
   if (!v?.snapshot || !doc.value) return false
@@ -100,8 +108,10 @@ async function submitRestore() {
       alert('该版本与当前内容一致，无需恢复。')
     } else if (res.status === 'no-snapshot') {
       alert('该版本没有内容快照，无法恢复。')
+    } else if (res.status === 'guest') {
+      alert('访客不能发起恢复评审，请先登录。')
     } else {
-      alert('恢复评审提交失败，请重试。')
+      alert('你没有该文档的评审发起权限，无法提交恢复评审。')
     }
   } finally {
     restoreBusy.value = false
@@ -127,11 +137,12 @@ async function refresh() {
 const activeGrant = computed(() => (doc.value ? accessStore.grantOf(doc.value.id, auth.user?.id) : null))
 // 是否可查看详情（随授权记录响应式变化：撤销/到期即时收回）
 const hasViewAccess = computed(() => doc.value ? canViewDoc(doc.value, auth.user?.id, null, activeGrant.value) : false)
-const canEdit = computed(() => canEditDoc(auth.user?.role, doc.value, auth.user?.id, pendingReview.value, activeGrant.value))
+const canEdit = computed(() => canEditDoc(doc.value, { userId: auth.user?.id || GUEST_ID, role: auth.user?.role, grant: activeGrant.value, pendingReview: pendingReview.value }))
+// 删除是破坏性操作：限时协作授权不授予删除权，独立于正文编辑资格判定
+const canDelete = computed(() => canDeleteDoc(doc.value, { userId: auth.user?.id || GUEST_ID, role: auth.user?.role, pendingReview: pendingReview.value }))
 const isFav = computed(() => engagement.isFavorite(docId.value))
 const comments = computed(() => (doc.value ? kb.commentsOf(doc.value.id) : []))
 const userById = computed(() => Object.fromEntries(auth.users.map((u) => [u.id, u])))
-const pendingReview = computed(() => (doc.value ? reviewStore.pendingReviewOf(doc.value.id) : null))
 // 文档锁定提示：评审中正文保持旧版，编辑入口（非管理员）不可用
 const reviewLocked = computed(() => !!pendingReview.value && auth.user?.role !== 'admin')
 // 拥有者视角：管理本文档的访问申请
@@ -139,14 +150,22 @@ const isOwnerOrAdmin = computed(() => doc.value && (auth.user?.role === 'admin' 
 
 async function doDelete() {
   if (!confirm('确定删除该文档？此操作不可恢复。')) return
-  await kb.deleteDoc(doc.value.id)
+  const res = await kb.deleteDoc(doc.value.id, auth.user)
+  if (res?.status === 'forbidden') {
+    alert('你没有删除该文档的权限：仅拥有者、协作成员、管理员或持有效限时协作授权的成员可删除。')
+    return
+  }
   router.push('/docs')
 }
 
 async function postComment() {
   const content = commentText.value.trim()
   if (!content) return
-  await kb.addComment(doc.value.id, content, commentMentions.value, auth.user?.id)
+  const cmt = await kb.addComment(doc.value.id, content, commentMentions.value, auth.user?.id)
+  if (cmt?.status === 'forbidden') {
+    alert('访客不能发表评论，请先登录。')
+    return
+  }
   commentText.value = ''
   commentMentions.value = []
 }
@@ -198,7 +217,7 @@ watch(docId, () => { if (route.name === 'docDetail') { refresh(); showVersions.v
             <button class="btn" @click="shareOpen = true">🔗 分享</button>
             <button v-if="canEdit" class="btn" @click="router.push('/docs/' + doc.id + '/edit')">✎ 编辑</button>
             <button v-else-if="reviewLocked" class="btn" disabled title="评审中，请等待管理员审批">🔒 评审中</button>
-            <button v-if="canEdit" class="btn danger" @click="doDelete">🗑 删除</button>
+            <button v-if="canDelete" class="btn danger" @click="doDelete">🗑 删除</button>
           </div>
         </div>
         <div class="meta-row">

@@ -1,5 +1,5 @@
 // 知识文档评审流程：状态常量、权限判定、留痕工具（均为纯函数，便于复用与测试）
-import { ROLE, canEditContent } from './permission'
+import { ROLE, canEditContent, canEditDoc, isGuestUser } from './permission'
 
 // 评审单状态
 export const REVIEW = {
@@ -40,29 +40,37 @@ export function publishStateLabel(state) {
   return state === PUBLISH.IN_REVIEW ? '评审中' : '已发布'
 }
 
-// 发起评审：仅编辑者/管理员，且文档当前没有流转中的评审单
-export function canSubmitReview(role, doc, pendingReview) {
-  if (!doc || !canEditContent(role)) return false
+// 发起评审资格：
+// - 访客（未登录）一律不可发起；
+// - 文档已有流转中评审单时不可发起；
+// - 必须对该文档具备直接写入资格（拥有者/固定协作成员/管理员/持有效限时协作授权）。
+//   仅凭编辑者角色与他人文档无关时不可发起（修复角色级越权）；持限时阅读授权不可发起。
+// ctx: { userId, role, grant }
+export function canSubmitReview(doc, ctx = {}, pendingReview) {
+  if (!doc || isGuestUser(ctx.userId)) return false
+  if (!canEditContent(ctx.role)) return false
   if (isDocInReview(doc, pendingReview)) return false
-  return true
+  return canEditDoc(doc, ctx)
 }
 
 // 撤回评审：仅发起人本人（管理员可在评审中心直接处理，不提供撤回）
 export function canWithdrawReview(review, userId) {
-  return isReviewOpen(review) && review.submittedBy === userId
+  return isReviewOpen(review) && !isGuestUser(userId) && review.submittedBy === userId
 }
 
-// 审批（通过/驳回）：仅管理员，且评审单仍在流转中
-export function canReviewDecision(role, review) {
-  return role === ROLE.ADMIN && isReviewOpen(review)
+// 审批（通过/驳回）：仅管理员、已登录，且评审单仍在流转中。
+// 审批是评审中的唯一写入通道，联动正文回写与缺口工单结案必须先过此校验，
+// 防止非管理员直接调用 store 完成「未授权内容发布 / 工单结案」。
+export function canReviewDecision(role, review, userId) {
+  return role === ROLE.ADMIN && !isGuestUser(userId) && isReviewOpen(review)
 }
 
 // 评审意见：任何登录成员都可以在评审单下评论；未登录访客不可
 export function canCommentReview(role, review, userId) {
-  return isReviewOpen(review) && !!userId && !!role
+  return isReviewOpen(review) && !!userId && !!role && !isGuestUser(userId)
 }
 
-// 评审中是否允许直接编辑/保存正文：评审中一律锁定，仅管理员除外（管理员审批即为写入通道）
+// 评审中是否允许直接编辑/保存正文：与 canEditDoc 的锁定段保持一致（管理员可并发修改）
 export function canEditDocDuringReview(role, doc, pendingReview) {
   if (!isDocInReview(doc, pendingReview)) return true
   return role === ROLE.ADMIN

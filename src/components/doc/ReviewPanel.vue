@@ -3,12 +3,14 @@ import { ref, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useReviewStore } from '@/stores/review'
 import { useAuthStore } from '@/stores/auth'
+import { useAccessStore } from '@/stores/access'
 import MemberSelect from '@/components/common/MemberSelect.vue'
 import { formatDate, formatFull, avatarColor } from '@/utils/format'
 import {
   REVIEW, reviewStatusLabel, canWithdrawReview, canReviewDecision,
-  canCommentReview, timelineActionLabel, isRestoreReview
+  canCommentReview, canSubmitReview, timelineActionLabel, isRestoreReview
 } from '@/utils/review'
+import { GUEST_ID } from '@/utils/permission'
 import { diffBodyLines, versionRangeText } from '@/utils/version'
 
 const props = defineProps({
@@ -18,6 +20,7 @@ const props = defineProps({
 const router = useRouter()
 const reviewStore = useReviewStore()
 const auth = useAuthStore()
+const accessStore = useAccessStore()
 
 const commentText = ref('')
 const commentMentions = ref([])
@@ -83,9 +86,9 @@ async function postComment() {
   if (!content || !pending.value || busy.value) return
   busy.value = true
   try {
-    await reviewStore.addReviewComment(pending.value.id, content, commentMentions.value, auth.user)
-    commentText.value = ''
-    commentMentions.value = []
+    const cmt = await reviewStore.addReviewComment(pending.value.id, content, commentMentions.value, auth.user)
+    if (cmt?.status === 'guest') alert('访客不能发表评审意见，请先登录。')
+    else { commentText.value = ''; commentMentions.value = [] }
   } finally {
     busy.value = false
   }
@@ -102,6 +105,8 @@ async function decide(decision) {
       decisionOpen.value = false
       noteText.value = ''
       setTimeout(() => { justDecided.value = '' }, 3000)
+    } else if (res.status === 'guest' || res.status === 'denied') {
+      alert('只有管理员可以审批评审单。')
     } else {
       alert('操作失败：评审单状态已变化，请刷新后重试')
     }
@@ -115,15 +120,25 @@ async function withdraw() {
   if (!confirm('确定撤回本次评审？待审内容不会生效。')) return
   busy.value = true
   try {
-    await reviewStore.withdrawReview(pending.value.id, auth.user)
+    const res = await reviewStore.withdrawReview(pending.value.id, auth.user)
+    if (res.status === 'guest') alert('访客不能撤回评审，请先登录。')
+    else if (res.status !== 'ok') alert('撤回失败：评审单状态已变化，请刷新后重试。')
   } finally {
     busy.value = false
   }
 }
 
-const canDecide = computed(() => canReviewDecision(auth.user?.role, pending.value))
+const canDecide = computed(() => canReviewDecision(auth.user?.role, pending.value, auth.user?.id))
 const canWithdraw = computed(() => canWithdrawReview(pending.value, auth.user?.id))
 const canComment = computed(() => canCommentReview(auth.user?.role, pending.value, auth.user?.id))
+// 当前用户在本文档上的有效限时协作授权（仅协作者授权，不构成发起评审资格）
+const activeGrant = computed(() => accessStore.grantOf(props.doc.id, auth.user?.id))
+// 无流转评审单时的「发起评审」入口：同样要过文档级写入资格（访客/只读/无关系编辑者不可见）
+const canSubmit = computed(() => canSubmitReview(props.doc, {
+  userId: auth.user?.id || GUEST_ID,
+  role: auth.user?.role,
+  grant: activeGrant.value
+}, pending.value))
 
 function statusCls(r) {
   return { [REVIEW.PENDING]: 'st-pending', [REVIEW.APPROVED]: 'st-ok', [REVIEW.REJECTED]: 'st-no', [REVIEW.WITHDRAWN]: 'st-off' }[r.status]
@@ -140,9 +155,10 @@ watch(pending, (p) => { if (!p) decisionOpen.value = false })
       <span v-else-if="doc.lastReview" class="st" :class="statusCls({ status: doc.lastReview.status })">
         最近审批：{{ reviewStatusLabel(doc.lastReview.status) }}
       </span>
-      <button v-if="!pending" class="btn sm primary" @click="router.push('/docs/' + doc.id + '/edit?submitReview=1')">
+      <button v-if="canSubmit" class="btn sm primary" @click="router.push('/docs/' + doc.id + '/edit?submitReview=1')">
         发起评审
       </button>
+      <span v-else-if="!pending" class="submit-tip">仅拥有者、协作成员或管理员可发起评审</span>
     </div>
 
     <div v-if="justDecided" class="toast-line">✅ {{ justDecided }}</div>
@@ -272,6 +288,7 @@ watch(pending, (p) => { if (!p) decisionOpen.value = false })
 .rv-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
 .rv-title { font-weight: 700; font-size: 15px; }
 .rv-head .btn { margin-left: auto; }
+.submit-tip { margin-left: auto; font-size: 12px; color: var(--text-3); }
 .st { font-size: 12px; padding: 2px 10px; border-radius: 999px; }
 .st.sm { font-size: 11px; padding: 1px 8px; }
 .st-pending { background: #fef3c7; color: #b45309; }

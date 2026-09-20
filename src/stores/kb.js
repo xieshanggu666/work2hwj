@@ -6,6 +6,7 @@ import { ensureVersions, mergeDocFields, docSnapshot } from '@/utils/version'
 import { buildTimelineEntry } from '@/utils/review'
 import { GAP } from '@/utils/gap'
 import { isGrantActive, ACCESS_PERM } from '@/utils/access'
+import { canEditContent, canEditDoc, canDeleteDoc, GUEST_ID } from '@/utils/permission'
 import { useAuthStore } from './auth'
 import { useGapStore } from './gap'
 
@@ -47,6 +48,10 @@ export const useKbStore = defineStore('kb', () => {
 
   async function createDoc(payload, currentUser) {
     await loadAll()
+    // 新建文档属于内容发布：访客与只读角色无写入资格（路由层已拦一次，store 兜底防直接调用）
+    if (!currentUser?.id || currentUser.id === GUEST_ID || !canEditContent(currentUser.role)) {
+      return { status: 'forbidden' }
+    }
     const now = new Date().toISOString()
     const doc = {
       id: uid('doc'),
@@ -72,31 +77,55 @@ export const useKbStore = defineStore('kb', () => {
   // opts.baseVersion：编辑器打开文档时的版本号；保存时若库中版本更高，说明其他窗口已保存过
   // opts.base：编辑器打开时的字段快照，用于三方合并（只自动合并未被对方改动的字段）
   // opts.force：用户确认「以我的内容为准」时强制保存，冲突字段取本次提交值
-  // 返回 { status: 'saved', doc, autoMerged } | { status: 'conflict', conflictFields, autoMerged, latest } | { status: 'missing' }
+  // opts.shareToken：共享链接编辑入口必须携带；store 据此复核链接仍有效且为 edit，
+  //   未携带凭证的写入一律视为无资格，防止访客/只读成员直接调用 store 写入。
+  // 返回 { status: 'saved', doc, autoMerged } | { status: 'conflict', conflictFields, autoMerged, latest }
+  //      | { status: 'missing' } | { status: 'review-locked' | 'access-denied', latest }
   async function updateDoc(id, patch, currentUser, note, opts = {}) {
     await loadAll()
     const now = new Date().toISOString()
-    const savedBy = currentUser?.id || 'u-guest'
+    const savedBy = currentUser?.id || GUEST_ID
+    const isGuest = savedBy === GUEST_ID
     let result = null
-    // 读 + 写放在同一事务中，保证「检测版本 → 合并 → 追加版本记录」不被其他窗口的写入打断
-    await db.transaction('rw', db.docs, db.accessRequests, async () => {
+    // 读 + 写放在同一事务中，保证「权限/版本检测 → 合并 → 追加版本记录」不被其他窗口的写入打断
+    await db.transaction('rw', db.docs, db.accessRequests, db.shares, db.reviews, async () => {
       const existing = await db.docs.get(id)
       if (!existing) { result = { status: 'missing' }; return }
-      // 评审中锁定：仅管理员可直接写入（管理员写入通道为审批，这里兜底防御多窗口/共享链接绕过）
-      if (existing.activeReviewId && savedBy !== 'u-guest') {
-        const isAdmin = currentUser?.role === 'admin'
-        if (!isAdmin) { result = { status: 'review-locked', latest: existing }; return }
-      }
-      // 非拥有者/非固定协作成员（如只读角色）写入：必须持有效限时协作授权，否则拒绝。
-      // 防止仅前端放开编辑入口被多窗口/直接调用绕过；授权撤销或到期后保存立即收回
-      const isOwnerOrEditor = existing.ownerId === savedBy || (existing.editors || []).includes(savedBy)
-      const isContentRole = currentUser?.role === 'admin' || currentUser?.role === 'editor'
-      if (!isOwnerOrEditor && !isContentRole && savedBy !== 'u-guest') {
+      // 事务内重读评审状态：评审中锁定仅管理员可直接写（管理员并发修改通道），
+      // 访客借共享链接、只读成员、限时协作者在锁定期一律拒绝（防止多窗口绕过页面锁定）
+      const pendingReview = await db.reviews
+        .where('docId').equals(id)
+        .filter((rv) => rv.status === 'pending').first()
+      // 限时协作授权：以库中最新申请记录判定，撤销/到期保存时立即收回
+      let grant = null
+      if (!isGuest) {
         const grantReq = await db.accessRequests
           .where('docId').equals(id)
           .filter((r) => r.applicantId === savedBy).toArray()
-        const collab = grantReq.find((r) => isGrantActive(r) && r.grant?.permission === ACCESS_PERM.COLLAB)
-        if (!collab) { result = { status: 'access-denied', latest: existing }; return }
+        grant = grantReq.find((r) => isGrantActive(r) && r.grant?.permission === ACCESS_PERM.COLLAB) || null
+      }
+      // 共享链接凭证：仅当入口显式携带 token 时才复核（普通成员/管理员保存不依赖链接）
+      let share = null
+      if (opts.shareToken) {
+        share = await db.shares.where('token').equals(opts.shareToken).first() || null
+        if (!share || share.docId !== id) share = null
+      }
+      if (!canEditDoc(existing, {
+        userId: savedBy,
+        role: currentUser?.role,
+        grant,
+        share,
+        pendingReview
+      })) {
+        // 拒绝原因区分优先级：评审锁定（含访客借链接写入）→ 访客无凭证 → 其余无资格
+        if (pendingReview && currentUser?.role !== 'admin') {
+          result = { status: 'review-locked', latest: existing }
+        } else if (isGuest) {
+          result = { status: 'guest', latest: existing }
+        } else {
+          result = { status: 'access-denied', latest: existing }
+        }
+        return
       }
       // 兼容已有文档：缺失的版本记录先补全，再在其后追加，历史版本永不丢弃
       const versions = ensureVersions(existing, now)
@@ -142,29 +171,54 @@ export const useKbStore = defineStore('kb', () => {
     return result
   }
 
-  async function deleteDoc(id) {
-    await db.docs.delete(id)
-    await db.comments.where('docId').equals(id).delete()
-    await db.shares.where('docId').equals(id).delete()
-    // 评审单随文档一并清理（直接按索引删除，避免与 review store 循环依赖）
-    await db.reviews.where('docId').equals(id).delete()
-    // 访问申请/授权随文档一并清理（授权失去依附对象，详情、搜索、问答、编辑入口同步消失）
-    await db.accessRequests.where('docId').equals(id).delete()
-    // 关联该文档的缺口工单退回处理中：答案来源/送审关联随文档删除失效，需重新关联
-    const now = new Date().toISOString()
-    const linkedTickets = await db.gapTickets.where('docId').equals(id).toArray()
-    for (const t of linkedTickets) {
-      await db.gapTickets.update(t.id, {
-        status: GAP.CLAIMED,
-        docId: null,
-        reviewId: null,
-        resolvedAt: null,
-        timeline: [...(t.timeline || []), buildTimelineEntry('reset', 'system', '关联文档已删除，工单退回处理', now)]
-      })
-    }
+  // 删除文档为破坏性操作：仅拥有者/固定协作成员/管理员可执行（限时协作授权与共享链接不授予删除权）；
+  // 访客、评审中（非管理员）同样拒绝。返回 { status: 'ok' | 'forbidden' | 'missing' }
+  async function deleteDoc(id, currentUser) {
+    const userId = currentUser?.id || GUEST_ID
+    let result = { status: 'ok' }
+    await db.transaction('rw', db.docs, db.comments, db.shares, db.reviews, db.accessRequests, db.gapTickets, async () => {
+      const doc = await db.docs.get(id)
+      if (!doc) { result = { status: 'missing' }; return }
+      const pendingReview = await db.reviews
+        .where('docId').equals(id)
+        .filter((rv) => rv.status === 'pending').first()
+      if (!canDeleteDoc(doc, { userId, role: currentUser?.role, pendingReview })) {
+        result = { status: 'forbidden' }
+        return
+      }
+      await db.docs.delete(id)
+      await db.comments.where('docId').equals(id).delete()
+      await db.shares.where('docId').equals(id).delete()
+      // 评审单随文档一并清理（直接按索引删除，避免与 review store 循环依赖）
+      await db.reviews.where('docId').equals(id).delete()
+      // 访问申请/授权随文档一并清理（授权失去依附对象，详情、搜索、问答、编辑入口同步消失）
+      await db.accessRequests.where('docId').equals(id).delete()
+      // 关联该文档的缺口工单退回处理中：答案来源/送审关联随文档删除失效，需重新关联
+      const now = new Date().toISOString()
+      const linkedTickets = await db.gapTickets.where('docId').equals(id).toArray()
+      for (const t of linkedTickets) {
+        await db.gapTickets.update(t.id, {
+          status: GAP.CLAIMED,
+          docId: null,
+          reviewId: null,
+          resolvedAt: null,
+          timeline: [...(t.timeline || []), buildTimelineEntry('reset', 'system', '关联文档已删除，工单退回处理', now)]
+        })
+      }
+    })
     comments.value = comments.value.filter((c) => c.docId !== id)
     const gap = useGapStore()
     await Promise.all([reloadDocs(), gap.reload()])
+    return result
+  }
+
+  // 普通文档评论：登录成员可发表（访客不可）。返回评论对象或 { status: 'forbidden' }
+  async function addComment(docId, content, mentionIds, authorId) {
+    if (!authorId || authorId === GUEST_ID) return { status: 'forbidden' }
+    const cmt = { id: uid('cmt'), docId, authorId, content, mentionIds: mentionIds || [], createdAt: new Date().toISOString() }
+    await db.comments.add(cmt)
+    comments.value.push(cmt)
+    return cmt
   }
 
   async function addCategory(name, icon) {
@@ -179,14 +233,6 @@ export const useKbStore = defineStore('kb', () => {
     await db.tags.add(tag)
     tags.value.push(tag)
     return tag
-  }
-
-  // ---- 评论 ----
-  async function addComment(docId, content, mentionIds, authorId) {
-    const cmt = { id: uid('cmt'), docId, authorId, content, mentionIds: mentionIds || [], createdAt: new Date().toISOString() }
-    await db.comments.add(cmt)
-    comments.value.push(cmt)
-    return cmt
   }
 
   function commentsOf(docId) {

@@ -46,6 +46,8 @@ async function submitGap() {
     // 成功后由 activeTicket 计算属性接管展示（该问题已提交补写需求）
     gapFormOpen.value = false
     gapDetail.value = ''
+  } else if (res.status === 'guest') {
+    alert('访客不能提交补写需求，请先登录。')
   }
 }
 

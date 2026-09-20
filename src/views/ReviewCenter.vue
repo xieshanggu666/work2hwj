@@ -51,8 +51,9 @@ async function decide(r, decision) {
   busyId.value = r.id
   try {
     const res = await reviewStore.decideReview(r.id, decision, (noteMap.value[r.id] || '').trim(), auth.user)
-    if (res.status !== 'ok') alert('操作失败：评审单状态已变化')
-    else noteMap.value[r.id] = ''
+    if (res.status === 'ok') noteMap.value[r.id] = ''
+    else if (res.status === 'guest' || res.status === 'denied') alert('只有管理员可以审批评审单。')
+    else alert('操作失败：评审单状态已变化')
   } finally {
     busyId.value = ''
   }

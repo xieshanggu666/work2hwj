@@ -4,6 +4,7 @@ import { db } from '@/db'
 import { uid } from '@/utils/format'
 import { REVIEW, buildTimelineEntry } from '@/utils/review'
 import { GAP, normalizeQuestion, isGroupPrimary } from '@/utils/gap'
+import { canEditContent, GUEST_ID } from '@/utils/permission'
 
 // 知识缺口工单 store：
 // 成员把未解决的问答转为补写需求（open）→ 编辑者认领（claimed）→ 关联文档送审（in_review）→
@@ -68,10 +69,12 @@ export const useGapStore = defineStore('gap', () => {
       })
   }
 
-  // 成员提交补写需求。同问题存在未解决工单时直接返回已有工单，避免重复
+  // 成员提交补写需求。同问题存在未解决工单时直接返回已有工单，避免重复。
+  // 访客（未登录）不可建工单：缺口工单会进入认领/送审流程，必须有明确责任人
   async function createTicket({ question, detail }, currentUser) {
     await loadAll()
-    const userId = currentUser?.id || 'u-guest'
+    const userId = currentUser?.id || GUEST_ID
+    if (userId === GUEST_ID) return { status: 'guest' }
     const dup = activeTicketForQuestion(question)
     if (dup) return { status: 'duplicate', ticket: dup }
     const now = new Date().toISOString()
@@ -95,12 +98,14 @@ export const useGapStore = defineStore('gap', () => {
     return { status: 'ok', ticket }
   }
 
-  // 编辑者认领：open（且未并入组）→ claimed。组内工单由合并流程统一认领，不可单独认领
+  // 编辑者认领：open（且未并入组）→ claimed。组内工单由合并流程统一认领，不可单独认领。
+  // 事务内复核角色：访客/只读角色直接调用 store 同样拒绝
   async function claimTicket(id, currentUser) {
     await loadAll()
     const now = new Date().toISOString()
-    const userId = currentUser?.id || 'u-guest'
+    const userId = currentUser?.id || GUEST_ID
     let result = { status: 'error' }
+    if (userId === GUEST_ID || !canEditContent(currentUser?.role)) return { status: 'denied' }
     await db.transaction('rw', db.gapTickets, async () => {
       const t = await db.gapTickets.get(id)
       if (!t) { result = { status: 'missing' }; return }
@@ -122,8 +127,9 @@ export const useGapStore = defineStore('gap', () => {
   async function releaseTicket(id, currentUser) {
     await loadAll()
     const now = new Date().toISOString()
-    const userId = currentUser?.id || 'u-guest'
+    const userId = currentUser?.id || GUEST_ID
     let result = { status: 'error' }
+    if (userId === GUEST_ID || !canEditContent(currentUser?.role)) return { status: 'denied' }
     await db.transaction('rw', db.gapTickets, async () => {
       const t = await db.gapTickets.get(id)
       if (!t) { result = { status: 'missing' }; return }
@@ -148,9 +154,11 @@ export const useGapStore = defineStore('gap', () => {
   async function mergeTickets(ticketIds, currentUser) {
     await loadAll()
     const now = new Date().toISOString()
-    const userId = currentUser?.id || 'u-guest'
+    const userId = currentUser?.id || GUEST_ID
     const isAdmin = currentUser?.role === 'admin'
     let result = { status: 'error' }
+    // 合并认领是编辑者治理操作：访客/只读角色直接拒绝
+    if (userId === GUEST_ID || !canEditContent(currentUser?.role)) return { status: 'denied' }
 
     await db.transaction('rw', db.gapTickets, async () => {
       const picked = []
@@ -211,9 +219,10 @@ export const useGapStore = defineStore('gap', () => {
   async function removeFromGroup(ticketId, currentUser) {
     await loadAll()
     const now = new Date().toISOString()
-    const userId = currentUser?.id || 'u-guest'
+    const userId = currentUser?.id || GUEST_ID
     const isAdmin = currentUser?.role === 'admin'
     let result = { status: 'error' }
+    if (userId === GUEST_ID) return { status: 'denied' }
 
     await db.transaction('rw', db.gapTickets, async () => {
       const t = await db.gapTickets.get(ticketId)
@@ -263,9 +272,10 @@ export const useGapStore = defineStore('gap', () => {
   async function dissolveGroup(groupId, currentUser) {
     await loadAll()
     const now = new Date().toISOString()
-    const userId = currentUser?.id || 'u-guest'
+    const userId = currentUser?.id || GUEST_ID
     const isAdmin = currentUser?.role === 'admin'
     let result = { status: 'error' }
+    if (userId === GUEST_ID) return { status: 'denied' }
 
     await db.transaction('rw', db.gapTickets, async () => {
       const members = await db.gapTickets.where('groupId').equals(groupId).toArray()

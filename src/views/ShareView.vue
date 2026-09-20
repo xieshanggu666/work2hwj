@@ -8,7 +8,8 @@ import { useReviewStore } from '@/stores/review'
 import DocPill from '@/components/common/DocPill.vue'
 import RichEditor from '@/components/doc/RichEditor.vue'
 import { formatFull } from '@/utils/format'
-import { shareStatus, canShareEdit } from '@/utils/share'
+import { shareStatus } from '@/utils/share'
+import { canEditDoc, GUEST_ID } from '@/utils/permission'
 import { docVersion } from '@/utils/version'
 
 const route = useRoute()
@@ -34,8 +35,13 @@ const savedToast = ref('')
 const token = computed(() => route.params.token)
 const backupKey = computed(() => 'kb:share-backup:' + (doc.value?.id || ''))
 const userById = computed(() => Object.fromEntries(auth.users.map((u) => [u.id, u])))
-// 编辑入口与链接状态绑定：撤销/过期后立即失去编辑权限；评审中同样锁定
-const editable = computed(() => canShareEdit(share.value) && !reviewStore.pendingReviewOf(doc.value?.id))
+// 编辑入口与链接状态、评审锁定统一走 canEditDoc：撤销/过期/评审锁定立即失去编辑权限
+const editable = computed(() => canEditDoc(doc.value, {
+  userId: GUEST_ID,
+  role: null,
+  share: share.value,
+  pendingReview: reviewStore.pendingReviewOf(doc.value?.id)
+}))
 const reviewLockedShare = computed(() => !!reviewStore.pendingReviewOf(doc.value?.id))
 
 async function resolve(tokenVal) {
@@ -91,12 +97,17 @@ async function saveEdit(force = false) {
   if (saving.value) return
   saving.value = true
   try {
-    const res = await kb.updateDoc(doc.value.id, { body: editBody.value }, auth.user, '通过共享链接编辑', { baseVersion: baseVersion.value, base: baseDoc.value, force })
+    // 携带共享 token：store 事务内复核链接仍有效且可编辑，未携带/失效一律拒绝
+    const res = await kb.updateDoc(doc.value.id, { body: editBody.value }, auth.user, '通过共享链接编辑', {
+      baseVersion: baseVersion.value, base: baseDoc.value, force, shareToken: token.value
+    })
     if (!res || res.status === 'missing') { status.value = 'notfound'; return }
-    if (res.status === 'review-locked') {
+    if (res.status === 'guest' || res.status === 'access-denied' || res.status === 'review-locked') {
       conflict.value = null
       editing.value = false
-      savedToast.value = '文档正在评审中，暂无法通过共享链接保存'
+      savedToast.value = res.status === 'review-locked'
+        ? '文档正在评审中，暂无法通过共享链接保存'
+        : '共享链接已失效或无编辑权限，无法保存'
       setTimeout(() => { savedToast.value = '' }, 3000)
       await resolve(token.value)
       return

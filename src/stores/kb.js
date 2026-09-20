@@ -6,8 +6,52 @@ import { ensureVersions, mergeDocFields, docSnapshot } from '@/utils/version'
 import { buildTimelineEntry } from '@/utils/review'
 import { GAP } from '@/utils/gap'
 import { isGrantActive, ACCESS_PERM } from '@/utils/access'
+import { canShareEdit } from '@/utils/share'
+import { ROLE, GUEST_ID, isLoginUser } from '@/utils/permission'
 import { useAuthStore } from './auth'
 import { useGapStore } from './gap'
+
+// 库内写入鉴权（权威防线，UI 判定可被多窗口/直接调用绕过，所有写库前必须在此复核）。
+// 在写事务内、对「最新读到的文档」判定，保证撤销/到期/锁定等并发变化即时生效：
+// - 访客（无 id 或 u-guest）一律拒绝写文档（唯一例外是持有效可编辑共享链接的直改）
+// - 评审锁定（activeReviewId 存在）：仅管理员可直改；共享链接编辑同样被锁
+// - 文档协作身份：管理员 / 拥有者 / 固定协作成员 / 有效 collab 授权
+// - 共享编辑：提供了 active + permission=edit 的 share 记录（直改正文，不走送审）。
+//   事务内按 token 重读最新链接，编辑期间被撤销/过期也能即时收回（不信任传入的内存快照）。
+// 返回 null 表示放行，否则为拒绝原因（access-denied / review-locked）
+async function checkDocWriteAuth(existing, currentUser, share) {
+  const userId = currentUser?.id
+  const role = currentUser?.role
+
+  // 共享编辑通道：按 token 事务内重读最新链接状态
+  let freshShare = null
+  if (share?.token) {
+    freshShare = await db.shares.where('token').equals(share.token).first()
+    // 链接必须仍归属该文档，防止拿 A 文档的有效链接去写 B 文档
+    if (!freshShare || freshShare.docId !== existing.id) freshShare = null
+  }
+
+  if (!isLoginUser(userId) && !canShareEdit(freshShare)) return 'access-denied'
+
+  // 评审锁定优先：评审中仅管理员可直改（管理员写入通道为审批，这里兜底防御多窗口/共享链接绕过）
+  if (existing.activeReviewId && role !== ROLE.ADMIN) return 'review-locked'
+
+  if (role === ROLE.ADMIN) return null
+  if (existing.ownerId === userId) return null
+  if ((existing.editors || []).includes(userId)) return null
+
+  // 限时协作授权：事务内查最新授权记录，撤销/到期/read 授权均不放行
+  const reqs = await db.accessRequests
+    .where('docId').equals(existing.id)
+    .filter((r) => r.applicantId === userId).toArray()
+  const collab = reqs.find((r) => isGrantActive(r) && r.grant?.permission === ACCESS_PERM.COLLAB)
+  if (collab) return null
+
+  // 有效可编辑共享链接（访客/非协作者可直接改正文，链接撤销/过期即收回）
+  if (canShareEdit(freshShare)) return null
+
+  return 'access-denied'
+}
 
 export const useKbStore = defineStore('kb', () => {
   const docs = ref([])
@@ -48,6 +92,11 @@ export const useKbStore = defineStore('kb', () => {
   async function createDoc(payload, currentUser) {
     await loadAll()
     const now = new Date().toISOString()
+    const userId = currentUser?.id
+    // 访客与只读角色不得新建文档（路由 meta 是第一道，此处为写库前的权威校验）
+    if (!isLoginUser(userId) || !(currentUser?.role === ROLE.ADMIN || currentUser?.role === ROLE.EDITOR)) {
+      return { status: 'access-denied' }
+    }
     const doc = {
       id: uid('doc'),
       title: payload.title || '无标题文档',
@@ -57,11 +106,11 @@ export const useKbStore = defineStore('kb', () => {
       visibility: payload.visibility || 'public',
       publishState: 'published',
       activeReviewId: null,
-      ownerId: currentUser?.id || 'u-guest',
-      editors: [currentUser?.id || 'u-guest'],
+      ownerId: userId,
+      editors: [userId],
       createdAt: now,
       updatedAt: now,
-      versions: [{ version: 1, savedAt: now, savedBy: currentUser?.id || 'u-guest', note: '创建文档', snapshot: docSnapshot(payload) }]
+      versions: [{ version: 1, savedAt: now, savedBy: userId, note: '创建文档', snapshot: docSnapshot(payload) }]
     }
     await db.docs.add(doc)
     await reloadDocs()
@@ -72,32 +121,22 @@ export const useKbStore = defineStore('kb', () => {
   // opts.baseVersion：编辑器打开文档时的版本号；保存时若库中版本更高，说明其他窗口已保存过
   // opts.base：编辑器打开时的字段快照，用于三方合并（只自动合并未被对方改动的字段）
   // opts.force：用户确认「以我的内容为准」时强制保存，冲突字段取本次提交值
-  // 返回 { status: 'saved', doc, autoMerged } | { status: 'conflict', conflictFields, autoMerged, latest } | { status: 'missing' }
+  // opts.share：共享链接编辑凭证（share 记录）；仅 active + permission=edit 才授权直改
+  // 返回 { status: 'saved', doc, autoMerged } | { status: 'conflict', conflictFields, autoMerged, latest }
+  //      | { status: 'missing' } | { status: 'access-denied', latest } | { status: 'review-locked', latest }
   async function updateDoc(id, patch, currentUser, note, opts = {}) {
     await loadAll()
     const now = new Date().toISOString()
-    const savedBy = currentUser?.id || 'u-guest'
+    const savedBy = currentUser?.id || GUEST_ID
     let result = null
-    // 读 + 写放在同一事务中，保证「检测版本 → 合并 → 追加版本记录」不被其他窗口的写入打断
-    await db.transaction('rw', db.docs, db.accessRequests, async () => {
+    // 读 + 写放在同一事务中，保证「鉴权 → 检测版本 → 合并 → 追加版本记录」不被其他窗口的写入打断
+    await db.transaction('rw', db.docs, db.accessRequests, db.shares, async () => {
       const existing = await db.docs.get(id)
       if (!existing) { result = { status: 'missing' }; return }
-      // 评审中锁定：仅管理员可直接写入（管理员写入通道为审批，这里兜底防御多窗口/共享链接绕过）
-      if (existing.activeReviewId && savedBy !== 'u-guest') {
-        const isAdmin = currentUser?.role === 'admin'
-        if (!isAdmin) { result = { status: 'review-locked', latest: existing }; return }
-      }
-      // 非拥有者/非固定协作成员（如只读角色）写入：必须持有效限时协作授权，否则拒绝。
-      // 防止仅前端放开编辑入口被多窗口/直接调用绕过；授权撤销或到期后保存立即收回
-      const isOwnerOrEditor = existing.ownerId === savedBy || (existing.editors || []).includes(savedBy)
-      const isContentRole = currentUser?.role === 'admin' || currentUser?.role === 'editor'
-      if (!isOwnerOrEditor && !isContentRole && savedBy !== 'u-guest') {
-        const grantReq = await db.accessRequests
-          .where('docId').equals(id)
-          .filter((r) => r.applicantId === savedBy).toArray()
-        const collab = grantReq.find((r) => isGrantActive(r) && r.grant?.permission === ACCESS_PERM.COLLAB)
-        if (!collab) { result = { status: 'access-denied', latest: existing }; return }
-      }
+      // 统一写入鉴权：访客/非协作者/授权失效拒绝；评审锁定仅管理员可直改；共享链接撤销过期即收回。
+      // 在事务内对最新文档复核，防止前端入口放开后被多窗口/直接调用绕过
+      const denied = await checkDocWriteAuth(existing, currentUser, opts.share)
+      if (denied) { result = { status: denied, latest: existing }; return }
       // 兼容已有文档：缺失的版本记录先补全，再在其后追加，历史版本永不丢弃
       const versions = ensureVersions(existing, now)
       const currentVersion = versions.length

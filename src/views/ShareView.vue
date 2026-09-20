@@ -91,8 +91,21 @@ async function saveEdit(force = false) {
   if (saving.value) return
   saving.value = true
   try {
-    const res = await kb.updateDoc(doc.value.id, { body: editBody.value }, auth.user, '通过共享链接编辑', { baseVersion: baseVersion.value, base: baseDoc.value, force })
+    // 传入共享链接凭证：store 事务内复核链接仍 active 且 permission=edit；
+    // 链接被撤销/过期、或文档进入评审锁定，保存都会被拒绝（防越权写入）
+    const res = await kb.updateDoc(doc.value.id, { body: editBody.value }, auth.user, '通过共享链接编辑', {
+      baseVersion: baseVersion.value, base: baseDoc.value, force, share: share.value
+    })
     if (!res || res.status === 'missing') { status.value = 'notfound'; return }
+    if (res.status === 'access-denied') {
+      // 链接可能在编辑期间被撤销/过期：刷新链接状态，回到只读
+      conflict.value = null
+      editing.value = false
+      savedToast.value = '共享链接已失效或无编辑权限，修改未保存'
+      setTimeout(() => { savedToast.value = '' }, 3000)
+      await resolve(token.value)
+      return
+    }
     if (res.status === 'review-locked') {
       conflict.value = null
       editing.value = false

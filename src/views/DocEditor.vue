@@ -119,6 +119,9 @@ async function submit(force = false) {
           alert('该文档已有流转中的评审单，请等待管理员审批后再发起。')
         } else if (res.status === 'missing') {
           alert('文档不存在或已被删除')
+        } else if (res.status === 'guest' || res.status === 'denied') {
+          alert('你没有该文档的评审发起权限：仅拥有者、协作成员或持有效「限时协作」授权的编辑者可送审。')
+          await load()
         }
         return
       }
@@ -139,6 +142,7 @@ async function submit(force = false) {
       router.push({ path: '/docs/' + route.params.id, query })
     } else {
       const d = await kb.createDoc(payload, auth.user)
+      if (d.status === 'access-denied') { alert('你没有新建文档的权限，请以编辑者或管理员身份登录。'); return }
       localStorage.removeItem(draftKey)
       // 从缺口工单「新建文档补写」进入：发布文档后回到工单中心继续关联送审
       if (route.query.gap) {

@@ -4,9 +4,34 @@ import { db } from '@/db'
 import { uid } from '@/utils/format'
 import { ensureVersions, docSnapshot, diffVersionFields, applyRestoreBoundary, restoreRollbackInfo } from '@/utils/version'
 import { REVIEW, PUBLISH, buildTimelineEntry } from '@/utils/review'
+import { ROLE, GUEST_ID, isLoginUser, canSubmitDocReview } from '@/utils/permission'
+import { isGrantActive, ACCESS_PERM } from '@/utils/access'
 import { GAP } from '@/utils/gap'
 import { useKbStore } from './kb'
 import { useGapStore } from './gap'
+
+// 事务内复核送审人对文档的协作身份（拥有者/固定协作者/有效 collab 授权/管理员）。
+// 与普通编辑、共享编辑共用同一道文档级鉴权；撤销/到期的授权在此刻即失效。
+async function docWriteIdentityInTx(doc, userId, role) {
+  if (role === ROLE.ADMIN) return true
+  if (doc.ownerId === userId) return true
+  if ((doc.editors || []).includes(userId)) return true
+  const reqs = await db.accessRequests
+    .where('docId').equals(doc.id)
+    .filter((r) => r.applicantId === userId).toArray()
+  return reqs.some((r) => isGrantActive(r) && r.grant?.permission === ACCESS_PERM.COLLAB)
+}
+
+// 送审统一前置校验（角色 + 登录 + 文档协作身份 + 评审锁定）。
+// 返回拒绝状态字符串或 null（放行）。pendingReview 用库内实时查询，不依赖内存缓存。
+async function assertSubmitAllowed(doc, currentUser) {
+  const userId = currentUser?.id
+  const role = currentUser?.role
+  if (!isLoginUser(userId)) return 'guest'
+  if (role !== ROLE.ADMIN && role !== ROLE.EDITOR) return 'denied'
+  if (!await docWriteIdentityInTx(doc, userId, role)) return 'denied'
+  return null
+}
 
 // 知识文档评审流程 store：
 // 发起（快照待审内容、文档置为评审中并锁定）→ 成员发表评审意见 →
@@ -88,12 +113,15 @@ export const useReviewStore = defineStore('review', () => {
     await kb.loadAll()
     await loadAll()
     const now = new Date().toISOString()
-    const userId = currentUser?.id || 'u-guest'
+    const userId = currentUser?.id || GUEST_ID
     let result = { status: 'error' }
 
-    await db.transaction('rw', db.docs, db.reviews, db.comments, async () => {
+    await db.transaction('rw', db.docs, db.reviews, db.comments, db.accessRequests, async () => {
       const doc = await db.docs.get(docId)
       if (!doc) { result = { status: 'missing' }; return }
+      // 统一送审鉴权：访客/只读/非协作者/授权失效拒绝；非内容角色拒绝
+      const denied = await assertSubmitAllowed(doc, currentUser)
+      if (denied) { result = { status: denied }; return }
       const existingPending = await db.reviews
         .where('docId').equals(docId)
         .filter((r) => r.status === REVIEW.PENDING).first()
@@ -129,12 +157,15 @@ export const useReviewStore = defineStore('review', () => {
     await kb.loadAll()
     await loadAll()
     const now = new Date().toISOString()
-    const userId = currentUser?.id || 'u-guest'
+    const userId = currentUser?.id || GUEST_ID
     let result = { status: 'error' }
 
-    await db.transaction('rw', db.docs, db.reviews, db.comments, async () => {
+    await db.transaction('rw', db.docs, db.reviews, db.comments, db.accessRequests, async () => {
       const doc = await db.docs.get(docId)
       if (!doc) { result = { status: 'missing' }; return }
+      // 恢复评审与普通送审共用同一道鉴权
+      const denied = await assertSubmitAllowed(doc, currentUser)
+      if (denied) { result = { status: denied }; return }
       const existingPending = await db.reviews
         .where('docId').equals(docId)
         .filter((r) => r.status === REVIEW.PENDING).first()
@@ -193,15 +224,20 @@ export const useReviewStore = defineStore('review', () => {
     await kb.loadAll()
     await loadAll()
     const now = new Date().toISOString()
-    const userId = currentUser?.id || 'u-guest'
-    const isAdmin = currentUser?.role === 'admin'
+    const userId = currentUser?.id || GUEST_ID
+    const isAdmin = currentUser?.role === ROLE.ADMIN
     let result = { status: 'error' }
     let submittedComment = null
 
     try {
-      await db.transaction('rw', db.docs, db.reviews, db.comments, db.gapTickets, async () => {
+      await db.transaction('rw', db.docs, db.reviews, db.comments, db.gapTickets, db.accessRequests, async () => {
         const ticket = await db.gapTickets.get(ticketId)
         if (!ticket) { result = { status: 'ticket-missing' }; return }
+
+        // 送审属内容治理：访客与只读角色不得借工单通道发布内容（避免未授权发布并联动工单结案）
+        if (!isLoginUser(userId) || (currentUser?.role !== ROLE.ADMIN && currentUser?.role !== ROLE.EDITOR)) {
+          result = { status: 'denied' }; return
+        }
 
         // 合并组：主工单发起，全组统一送审；组成员单独送审直接拒绝
         const members = ticket.groupId
@@ -220,6 +256,11 @@ export const useReviewStore = defineStore('review', () => {
 
         const doc = await db.docs.get(docId)
         if (!doc) { result = { status: 'doc-missing' }; return }
+        // 送审人须对该文档有协作身份（拥有者/固定协作者/有效 collab 授权/管理员），
+        // 与普通编辑、共享编辑统一；不能把无权编辑的他人文档拿去送审发布
+        if (!await docWriteIdentityInTx(doc, userId, currentUser?.role)) {
+          result = { status: 'denied' }; return
+        }
         const existingPending = await db.reviews
           .where('docId').equals(docId)
           .filter((r) => r.status === REVIEW.PENDING).first()
@@ -273,12 +314,13 @@ export const useReviewStore = defineStore('review', () => {
     const kb = useKbStore()
     await loadAll()
     const now = new Date().toISOString()
-    const userId = currentUser?.id || 'u-guest'
+    const userId = currentUser?.id || GUEST_ID
     let created = null
 
     await db.transaction('rw', db.reviews, db.comments, async () => {
       const review = await db.reviews.get(reviewId)
-      if (!review || review.status !== REVIEW.PENDING) return
+      // 访客（含 u-guest）不得发表评审意见；评审单须仍在流转中
+      if (!isLoginUser(userId) || !review || review.status !== REVIEW.PENDING) return
       const cmt = {
         id: uid('cmt'), docId: review.docId, reviewId, authorId: userId,
         content, mentionIds: mentionIds || [], createdAt: now
@@ -336,12 +378,15 @@ export const useReviewStore = defineStore('review', () => {
     const kb = useKbStore()
     await loadAll()
     const now = new Date().toISOString()
-    const userId = currentUser?.id || 'u-guest'
+    const userId = currentUser?.id || GUEST_ID
     let result = { status: 'error' }
 
     await db.transaction('rw', db.docs, db.reviews, db.gapTickets, async () => {
       const review = await db.reviews.get(reviewId)
       if (!review) { result = { status: 'missing' }; return }
+      // 审批闸门：仅登录管理员可决策。访客/只读/编辑者直接调用 store 一律拒绝，
+      // 防止未授权内容发布及缺口工单被联动结案
+      if (!isLoginUser(userId) || currentUser?.role !== ROLE.ADMIN) { result = { status: 'denied' }; return }
       if (review.status !== REVIEW.PENDING) { result = { status: 'closed', review }; return }
 
       const doc = await db.docs.get(review.docId)
@@ -442,6 +487,7 @@ export const useReviewStore = defineStore('review', () => {
     await db.transaction('rw', db.docs, db.reviews, db.gapTickets, async () => {
       const review = await db.reviews.get(reviewId)
       if (!review) { result = { status: 'missing' }; return }
+      if (!isLoginUser(userId)) { result = { status: 'denied' }; return }
       if (review.status !== REVIEW.PENDING || review.submittedBy !== userId) { result = { status: 'denied' }; return }
       const withdrawn = {
         ...review,

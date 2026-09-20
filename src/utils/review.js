@@ -1,5 +1,5 @@
 // 知识文档评审流程：状态常量、权限判定、留痕工具（均为纯函数，便于复用与测试）
-import { ROLE, canEditContent } from './permission'
+import { ROLE, canEditContent, isLoginUser, canSubmitDocReview } from './permission'
 
 // 评审单状态
 export const REVIEW = {
@@ -40,10 +40,13 @@ export function publishStateLabel(state) {
   return state === PUBLISH.IN_REVIEW ? '评审中' : '已发布'
 }
 
-// 发起评审：仅编辑者/管理员，且文档当前没有流转中的评审单
-export function canSubmitReview(role, doc, pendingReview) {
+// 发起评审：已登录内容角色 + 文档协作身份 + 无流转中评审单（统一走 canSubmitDocReview）。
+// 兼容旧签名 canSubmitReview(role, doc, pendingReview)：缺用户/授权信息时只做角色与锁定判定。
+export function canSubmitReview(role, doc, pendingReview, userId, grant) {
   if (!doc || !canEditContent(role)) return false
   if (isDocInReview(doc, pendingReview)) return false
+  // 提供了 userId 时按统一的文档协作身份校验；未提供（旧调用）保持仅角色+锁定的宽松判定
+  if (userId !== undefined) return canSubmitDocReview(role, doc, userId, pendingReview, grant)
   return true
 }
 
@@ -52,14 +55,15 @@ export function canWithdrawReview(review, userId) {
   return isReviewOpen(review) && review.submittedBy === userId
 }
 
-// 审批（通过/驳回）：仅管理员，且评审单仍在流转中
-export function canReviewDecision(role, review) {
+// 审批（通过/驳回）：仅管理员，且评审单仍在流转中（userId 用于事务内再次确认非访客）
+export function canReviewDecision(role, review, userId) {
+  if (userId !== undefined && !isLoginUser(userId)) return false
   return role === ROLE.ADMIN && isReviewOpen(review)
 }
 
-// 评审意见：任何登录成员都可以在评审单下评论；未登录访客不可
+// 评审意见：任何登录成员都可以在评审单下评论；未登录访客（含 u-guest）不可
 export function canCommentReview(role, review, userId) {
-  return isReviewOpen(review) && !!userId && !!role
+  return isReviewOpen(review) && isLoginUser(userId) && !!role
 }
 
 // 评审中是否允许直接编辑/保存正文：评审中一律锁定，仅管理员除外（管理员审批即为写入通道）

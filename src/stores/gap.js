@@ -3,6 +3,7 @@ import { ref, computed } from 'vue'
 import { db } from '@/db'
 import { uid } from '@/utils/format'
 import { REVIEW, buildTimelineEntry } from '@/utils/review'
+import { ROLE, GUEST_ID, isLoginUser } from '@/utils/permission'
 import { GAP, normalizeQuestion, isGroupPrimary } from '@/utils/gap'
 
 // 知识缺口工单 store：
@@ -99,11 +100,15 @@ export const useGapStore = defineStore('gap', () => {
   async function claimTicket(id, currentUser) {
     await loadAll()
     const now = new Date().toISOString()
-    const userId = currentUser?.id || 'u-guest'
+    const userId = currentUser?.id || GUEST_ID
     let result = { status: 'error' }
     await db.transaction('rw', db.gapTickets, async () => {
       const t = await db.gapTickets.get(id)
       if (!t) { result = { status: 'missing' }; return }
+      // 认领是送审/结案链路入口：仅登录的编辑者/管理员，访客与只读角色拒绝
+      if (!isLoginUser(userId) || !(currentUser?.role === ROLE.ADMIN || currentUser?.role === ROLE.EDITOR)) {
+        result = { status: 'denied' }; return
+      }
       if (t.groupId) { result = { status: 'grouped', ticket: t }; return }
       if (t.status !== GAP.OPEN) { result = { status: 'changed', ticket: t }; return }
       await db.gapTickets.update(id, {
@@ -148,9 +153,14 @@ export const useGapStore = defineStore('gap', () => {
   async function mergeTickets(ticketIds, currentUser) {
     await loadAll()
     const now = new Date().toISOString()
-    const userId = currentUser?.id || 'u-guest'
-    const isAdmin = currentUser?.role === 'admin'
+    const userId = currentUser?.id || GUEST_ID
+    const isAdmin = currentUser?.role === ROLE.ADMIN
     let result = { status: 'error' }
+
+    // 合并即统一认领并进入送审链路：仅登录的编辑者/管理员
+    if (!isLoginUser(userId) || !(isAdmin || currentUser?.role === ROLE.EDITOR)) {
+      return { status: 'denied' }
+    }
 
     await db.transaction('rw', db.gapTickets, async () => {
       const picked = []

@@ -13,7 +13,7 @@ import ReviewPanel from '@/components/doc/ReviewPanel.vue'
 import AccessApplyCard from '@/components/doc/AccessApplyCard.vue'
 import AccessPanel from '@/components/doc/AccessPanel.vue'
 import { formatFull, formatDate, avatarColor } from '@/utils/format'
-import { canEditDoc, canViewDoc, canEditContent } from '@/utils/permission'
+import { canEditDoc, canViewDoc, canSubmitDocReview } from '@/utils/permission'
 import { versionReviewBadge, versionRestoreBadges } from '@/utils/review'
 import { diffVersionFields, diffBodyLines, docSnapshot, fieldLabels, versionRangeText } from '@/utils/version'
 import { ACCESS, accessPermLabel, grantExpireText } from '@/utils/access'
@@ -66,8 +66,10 @@ const restorePreview = computed(() => {
   const rolledBack = versionList.value.filter((v) => v.version > fromV).map((v) => v.version)
   return { fromV, rolledBack }
 })
-// 编辑者/管理员且文档不在评审中时可发起恢复评审
-const canRestore = computed(() => canEditContent(auth.user?.role) && !pendingReview.value)
+// 编辑者/管理员且对本文档有协作身份、文档不在评审中时可发起恢复评审（与送审同一道校验）
+const canRestore = computed(() =>
+  canSubmitDocReview(auth.user?.role, doc.value, auth.user?.id, pendingReview.value, activeGrant.value)
+)
 
 function isIdentical(v) {
   if (!v?.snapshot || !doc.value) return false

@@ -5,6 +5,7 @@ import { useKbStore } from '@/stores/kb'
 import { useAuthStore } from '@/stores/auth'
 import { useReviewStore } from '@/stores/review'
 import { useGapStore } from '@/stores/gap'
+import { useAccessStore } from '@/stores/access'
 import DocPill from '@/components/common/DocPill.vue'
 import { formatDate, formatFull, avatarColor } from '@/utils/format'
 import {
@@ -12,7 +13,7 @@ import {
   isGroupPrimary, canClaimTicket, canReleaseTicket, canSubmitGapReview,
   canMergeTicket, canCommitMerge, canRemoveFromGroup, canDissolveGroup
 } from '@/utils/gap'
-import { canEditContent } from '@/utils/permission'
+import { canEditContent, hasDocWriteIdentity } from '@/utils/permission'
 import { reviewStatusLabel } from '@/utils/review'
 
 const route = useRoute()
@@ -21,6 +22,7 @@ const kb = useKbStore()
 const auth = useAuthStore()
 const reviewStore = useReviewStore()
 const gapStore = useGapStore()
+const accessStore = useAccessStore()
 
 const tab = ref(GAP.OPEN) // open | claimed | in_review | resolved | all
 const pickDoc = ref({}) // 工单/主工单 id -> 待送审的关联文档 id
@@ -98,10 +100,12 @@ const emptyText = computed(() => ({
   all: '暂无缺口工单，去智能问答提交未解决的问题吧'
 }[tab.value]))
 
-// 可关联的文档：当前没有流转中评审单的文档（送审会锁定文档，需错开）
+// 可关联的文档：当前没有流转中评审单，且当前用户对其有协作身份（拥有者/协作者/有效 collab 授权/管理员）。
+// 与送审 store 的文档级鉴权保持一致，避免选到无权编辑的文档再被事务拒绝
 const linkableDocs = computed(() =>
   [...kb.docs]
     .filter((d) => !reviewStore.pendingReviewOf(d.id))
+    .filter((d) => hasDocWriteIdentity(auth.user?.role, d, auth.user?.id, accessStore.grantOf(d.id, auth.user?.id)))
     .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))
 )
 
@@ -226,6 +230,8 @@ async function submitGapReview(t, memberCount) {
       alert('该文档已有流转中的评审单，请换一篇文档或等待审批完成。')
     } else if (res.status === 'ticket-changed') {
       alert('工单状态已变化（可能已被取消认领、移出或解散），请刷新查看。')
+    } else if (res.status === 'denied' || res.status === 'guest') {
+      alert('送审被拒绝：你需要是编辑者/管理员，且对所选文档拥有编辑权限（拥有者、协作者或有效限时协作授权）。')
     } else {
       alert('送审失败：工单或文档状态已变化，请刷新后重试。')
     }
@@ -240,7 +246,7 @@ function goNewDoc(t) {
 }
 
 onMounted(async () => {
-  await Promise.all([gapStore.loadAll(), reviewStore.loadAll()])
+  await Promise.all([gapStore.loadAll(), reviewStore.loadAll(), accessStore.loadAll()])
   // 从编辑器「新建文档补写」返回：定位到该工单并预选刚创建的文档
   if (route.query.pick) {
     tab.value = GAP.CLAIMED

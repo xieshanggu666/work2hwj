@@ -9,6 +9,8 @@ import {
   REVIEW, reviewStatusLabel, canWithdrawReview, canReviewDecision,
   canCommentReview, timelineActionLabel, isRestoreReview
 } from '@/utils/review'
+import { canSubmitDocReview } from '@/utils/permission'
+import { useAccessStore } from '@/stores/access'
 import { diffBodyLines, versionRangeText } from '@/utils/version'
 
 const props = defineProps({
@@ -17,6 +19,7 @@ const props = defineProps({
 
 const router = useRouter()
 const reviewStore = useReviewStore()
+const accessStore = useAccessStore()
 const auth = useAuthStore()
 
 const commentText = ref('')
@@ -124,6 +127,11 @@ async function withdraw() {
 const canDecide = computed(() => canReviewDecision(auth.user?.role, pending.value))
 const canWithdraw = computed(() => canWithdrawReview(pending.value, auth.user?.id))
 const canComment = computed(() => canCommentReview(auth.user?.role, pending.value, auth.user?.id))
+// 发起评审入口：与送审 store 同一道校验（登录内容角色 + 文档协作身份 + 无流转中评审单）
+const activeGrant = computed(() => accessStore.grantOf(props.doc.id, auth.user?.id))
+const canSubmit = computed(() =>
+  canSubmitDocReview(auth.user?.role, props.doc, auth.user?.id, pending.value, activeGrant.value)
+)
 
 function statusCls(r) {
   return { [REVIEW.PENDING]: 'st-pending', [REVIEW.APPROVED]: 'st-ok', [REVIEW.REJECTED]: 'st-no', [REVIEW.WITHDRAWN]: 'st-off' }[r.status]
@@ -140,7 +148,7 @@ watch(pending, (p) => { if (!p) decisionOpen.value = false })
       <span v-else-if="doc.lastReview" class="st" :class="statusCls({ status: doc.lastReview.status })">
         最近审批：{{ reviewStatusLabel(doc.lastReview.status) }}
       </span>
-      <button v-if="!pending" class="btn sm primary" @click="router.push('/docs/' + doc.id + '/edit?submitReview=1')">
+      <button v-if="!pending && canSubmit" class="btn sm primary" @click="router.push('/docs/' + doc.id + '/edit?submitReview=1')">
         发起评审
       </button>
     </div>

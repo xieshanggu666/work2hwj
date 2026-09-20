@@ -8,6 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "test:gap": "mkdir -p node_modules/.cache && esbuild scripts/run-gap-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/gap-test.mjs --alias:@=./src && node node_modules/.cache/gap-test.mjs",
+    "test:security": "mkdir -p node_modules/.cache && esbuild scripts/run-security-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/security-test.mjs --alias:@=./src && node node_modules/.cache/security-test.mjs",
     "test:restore": "mkdir -p node_modules/.cache && esbuild scripts/run-restore-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/restore-test.mjs --alias:@=./src && node node_modules/.cache/restore-test.mjs"
   },
   "dependencies": {
